@@ -61,6 +61,6 @@ void runAllTests(
   ];
 
   for (final (:name, :test) in allTests) {
-    testFn(name, test);
+    testFn(name, () async => test);
   }
 }
