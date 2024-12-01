@@ -150,12 +150,10 @@ jobs:
             --driver=test_driver/integration_test.dart \
             --target=integration_test/webcrypto_test.dart \
             -d chrome
-      
+      - run: flutter pub run test -p vm,chrome,firefox -j 3
       # Test with coverage collection as a separate step.
       # This will run in debug mode, so we test both with and without coverage.
-      - run: flutter pub run test -p vm,chrome,firefox --coverage ./coverage
-      - run: flutter pub run test -p vm,chrome,firefox
-
+      - run: flutter pub run test -p vm,chrome,firefox --coverage ./coverage -j 3
       # Report collected coverage
       - name: Convert coverage to lcov
         run: dart run coverage:format_coverage -i ./coverage -o ./coverage/lcov.info --lcov --report-on lib/
