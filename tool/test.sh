@@ -24,9 +24,6 @@ cd "$DIR/.."
 section 'Running "flutter pub get"'
 flutter pub get
 
-
-flutter pub run webcrypto:setup
-
 section 'flutter test (local)'
 flutter test
 
