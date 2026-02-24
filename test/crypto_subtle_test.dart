@@ -123,24 +123,24 @@ void main() {
     test('getRandomValues: too long', () {
       try {
         subtle.window.crypto.getRandomValues(Uint8List(1000000).toJS);
+        fail('Expected an error');
       } on subtle.JSDomException catch (e) {
-        // dart2js throws QuotaExceededError
         expect(e.name, 'QuotaExceededError');
       } on Error catch (e) {
-        // dart2wasm throws JavaScriptError
-        expect(e.toString(), 'JavaScriptError');
+        // dart2wasm throws _JavaScriptError (not public)
+        expect(e.toString(), contains('QuotaExceededError'));
       }
     });
 
     test('getRandomValues: not supported type', () {
       try {
         subtle.window.crypto.getRandomValues(Float32List(32).toJS);
+        fail('Expected an error');
       } on subtle.JSDomException catch (e) {
-        // dart2js throws TypeMismatchError
         expect(e.name, 'TypeMismatchError');
       } on Error catch (e) {
-        // dart2wasm throws JavaScriptError
-        expect(e.toString(), 'JavaScriptError');
+        // dart2wasm throws _JavaScriptError (not public)
+        expect(e.toString(), contains('TypeMismatchError'));
       }
     });
   });
