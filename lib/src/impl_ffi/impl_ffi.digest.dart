@@ -15,7 +15,8 @@
 part of 'impl_ffi.dart';
 
 abstract class _HashImpl implements HashImpl {
-  const _HashImpl();
+  final ssl.Hash _algo;
+  const _HashImpl(this._algo);
 
   factory _HashImpl.fromHash(HashImpl hash) {
     if (hash is _HashImpl) {
@@ -26,88 +27,37 @@ abstract class _HashImpl implements HashImpl {
     );
   }
 
-  @protected
-  ffi.Pointer<EVP_MD> Function() get _algorithm;
-
-  /// Get an instantiated [EVP_MD] for this hash algorithm.
-  ffi.Pointer<EVP_MD> get _md {
-    final md = _algorithm();
-    _checkOp(md.address != 0, fallback: 'failed to instantiate hash algorithm');
-    return md;
+  @override
+  Future<Uint8List> digestBytes(List<int> data) async {
+    return _algo.digest(data);
   }
 
   @override
-  Future<Uint8List> digestBytes(List<int> data) =>
-      digestStream(Stream.value(data));
-
-  @override
-  Future<Uint8List> digestStream(Stream<List<int>> data) {
-    return _Scope.async((scope) async {
-      final ctx = scope.create(ssl.EVP_MD_CTX_new, ssl.EVP_MD_CTX_free);
-      // Initialize with hash function
-      _checkOp(ssl.EVP_DigestInit(ctx, _md) == 1);
-
-      // Stream data
-      await _streamToUpdate(data, ctx, ssl.EVP_DigestUpdate);
-
-      // Get size of the output buffer
-      final size = ssl.EVP_MD_CTX_size(ctx);
-      _checkOp(size > 0); // sanity check
-
-      // Allocate output buffer and return output
-      final out = scope<ffi.Uint8>(size);
-      _checkOp(ssl.EVP_DigestFinal(ctx, out, ffi.nullptr) == 1);
-      return out.copy(size);
-    });
+  Future<Uint8List> digestStream(Stream<List<int>> data) async {
+    final ctx = _algo.start();
+    await for (final chunk in data) {
+      ctx.update(chunk);
+    }
+    return ctx.finish();
   }
 
-  /// Algorithm (`alg` for JWK) when this hash algorithm is used in an HMAC.
-  ///
-  /// For SHA-1, it returns 'HS1'.
-  /// For SHA-256, it returns 'HS256'.
-  /// For SHA-384, it returns 'HS384'.
-  /// For SHA-512, it returns 'HS512'.
-  ///
-  /// See canonical registry in:
-  /// https://www.iana.org/assignments/jose/jose.xhtml
   String get hmacJwkAlg;
-
-  /// Algorithm (`alg` for JWK) when this hash algorithm is used in RSA-OAEP.
-  ///
-  /// For SHA-1, it returns 'RSA-OAEP-1'.
-  /// For SHA-256, it returns 'RSA-OAEP-256'.
-  /// For SHA-384, it returns 'RSA-OAEP-384'.
-  /// For SHA-512, it returns 'RSA-OAEP-512'.
-  ///
-  /// See canonical registry in:
-  /// https://www.iana.org/assignments/jose/jose.xhtml
   String get rsaOaepJwkAlg;
-
-  /// Algorithm (`alg` for JWK) when this hash algorithm is used in RSA-PSS.
-  ///
-  /// For SHA-1, it returns 'PS1'.
-  /// For SHA-256, it returns 'PS256'.
-  /// For SHA-384, it returns 'PS384'.
-  /// For SHA-512, it returns 'PS512'.
-  ///
-  /// See canonical registry in:
-  /// https://www.iana.org/assignments/jose/jose.xhtml
   String get rsaPssJwkAlg;
-
-  /// Algorithm (`alg` for JWK) when this hash algorithm is used in RSASSA-PKCS1-v1_5.
-  ///
-  /// For SHA-1, it returns 'RS1'.
-  /// For SHA-256, it returns 'RS256'.
-  /// For SHA-384, it returns 'RS384'.
-  /// For SHA-512, it returns 'RS512'.
-  ///
-  /// See canonical registry in:
-  /// https://www.iana.org/assignments/jose/jose.xhtml
   String get rsassaPkcs1V15JwkAlg;
+
+  String get hashName;
+  int get digestLength;
 }
 
 final class _Sha1 extends _HashImpl {
-  const _Sha1();
+  const _Sha1() : super(ssl.Hash.sha1);
+
+  @override
+  String get hashName => 'SHA-1';
+
+  @override
+  int get digestLength => 20;
 
   @override
   String get hmacJwkAlg => 'HS1';
@@ -120,13 +70,16 @@ final class _Sha1 extends _HashImpl {
 
   @override
   String get rsassaPkcs1V15JwkAlg => 'RS1';
-
-  @override
-  ffi.Pointer<EVP_MD> Function() get _algorithm => ssl.EVP_sha1;
 }
 
 final class _Sha256 extends _HashImpl {
-  const _Sha256();
+  const _Sha256() : super(ssl.Hash.sha256);
+
+  @override
+  String get hashName => 'SHA-256';
+
+  @override
+  int get digestLength => 32;
 
   @override
   String get hmacJwkAlg => 'HS256';
@@ -139,13 +92,16 @@ final class _Sha256 extends _HashImpl {
 
   @override
   String get rsassaPkcs1V15JwkAlg => 'RS256';
-
-  @override
-  ffi.Pointer<EVP_MD> Function() get _algorithm => ssl.EVP_sha256;
 }
 
 final class _Sha384 extends _HashImpl {
-  const _Sha384();
+  const _Sha384() : super(ssl.Hash.sha384);
+
+  @override
+  String get hashName => 'SHA-384';
+
+  @override
+  int get digestLength => 48;
 
   @override
   String get hmacJwkAlg => 'HS384';
@@ -158,13 +114,16 @@ final class _Sha384 extends _HashImpl {
 
   @override
   String get rsassaPkcs1V15JwkAlg => 'RS384';
-
-  @override
-  ffi.Pointer<EVP_MD> Function() get _algorithm => ssl.EVP_sha384;
 }
 
 final class _Sha512 extends _HashImpl {
-  const _Sha512();
+  const _Sha512() : super(ssl.Hash.sha512);
+
+  @override
+  String get hashName => 'SHA-512';
+
+  @override
+  int get digestLength => 64;
 
   @override
   String get hmacJwkAlg => 'HS512';
@@ -177,10 +136,4 @@ final class _Sha512 extends _HashImpl {
 
   @override
   String get rsassaPkcs1V15JwkAlg => 'RS512';
-
-  @override
-  ffi.Pointer<EVP_MD> Function() get _algorithm => ssl.EVP_sha512;
 }
-
-// Note: Before adding new hash implementations, make sure to update all the
-//       places that does if (hash == HashImpl.shaXXX) ...

@@ -31,20 +31,18 @@ BigInt _parseBigEndian(List<int> data, [int? bitLength]) {
   bitLength ??= data.length * 8;
   assert(bitLength <= data.length * 8);
 
-  // Find the index of the first byte we have to read
   final init = data.length - (bitLength / 8).ceil();
-  // Find the remainder bits when reading the first byte
-  final remainder_bits = bitLength % 8;
-  // If there is any remainder bits, we make a copy and zero-out the rest of the
-  // initial byte
-  if (remainder_bits != 0) {
-    data = Uint8List.fromList(data);
-    data[init] &= ~(0xff << remainder_bits);
+  final remainderBits = bitLength % 8;
+
+  var copy = data;
+  if (remainderBits != 0) {
+    copy = Uint8List.fromList(data);
+    copy[init] &= ~(0xff << remainderBits);
   }
-  // Parse BigInt as big-endian integer.
+
   var value = BigInt.from(0);
-  for (var i = init; i < data.length; i++) {
-    value = (value << 8) | BigInt.from(data[i] & 0xf);
+  for (var i = init; i < copy.length; i++) {
+    value = (value << 8) | BigInt.from(copy[i] & 0xff);
   }
   return value;
 }
@@ -55,145 +53,65 @@ Stream<Uint8List> _aesCtrEncryptOrDecrypt(
   Stream<List<int>> source,
   List<int> counter,
   int length,
-) {
-  // Heavily inspired by Chromium Web Crypto implementation, see:
-  // https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/aes_ctr.cc#144
+) async* {
+  assert(counter.length == 16);
+  const blockSize = 16;
 
-  return _Scope.stream((scope) async* {
-    assert(counter.length == 16);
-    assert(key.length == 16 || key.length == 32);
-    final cipher = key.length == 16
-        ? ssl.EVP_aes_128_ctr()
-        : ssl.EVP_aes_256_ctr();
-    const blockSize = AES_BLOCK_SIZE;
+  final ctrValues = BigInt.one << length;
+  final ctr = _parseBigEndian(counter, length);
 
-    // Find the number of possible counter values, as the counter may not be
-    // reused this will limit how much data we can process. If we get more data
-    // than `blockSize * ctr_values`, Web Crypto will throw a `DataError`,
-    // which we shall mirror by throwing a [FormatException].
-    final ctr_values = BigInt.one << length;
+  var bytesUntilWraparound = (ctrValues - ctr) * BigInt.from(blockSize);
+  var bytesAfterWraparound = ctr * BigInt.from(blockSize);
 
-    // Read the counter
-    final ctr = _parseBigEndian(counter, length);
+  // Initialize context
+  // Use Uint8List.fromList to ensure we have a copy if needed, though AesCtr copies internally usually.
+  var ctx = encrypt
+      ? ssl.AesCtr.startEncrypt(key, Uint8List.fromList(counter))
+      : ssl.AesCtr.startDecrypt(key, Uint8List.fromList(counter));
 
-    // Number of bytes until wrap around. BoringSSL treats the counter as 128
-    // bit counter that can be incremented. While web crypto specifies the
-    // counter to be the first [length] bits of the `counter` parameter, and
-    // the rest of the `counter` parameter is a nonce. Hence, when the counter
-    // wraps around to zero, the left most `128 - length` bits should remain
-    // static. Which is not the behavior BoringSSL implements. We can do this
-    // with BoringSSL by managing the counter wrap-around manually. But to do
-    // this we must track the number of blocks until wrap-around.
-    var bytes_until_wraparound = (ctr_values - ctr) * BigInt.from(blockSize);
+  var isBeforeWrapAround = true;
 
-    // After wrap-around we cannot consume more than `ctr` blocks, or we'll
-    // reuse the same counter value which is not allowed.
-    var bytes_after_wraparound = ctr * BigInt.from(blockSize);
-
-    final ctx = scope.createEVP_CIPHER_CTX();
-    _checkOpIsOne(
-      ssl.EVP_CipherInit_ex(
-        ctx,
-        cipher,
-        ffi.nullptr,
-        scope.dataAsPointer(key),
-        scope.dataAsPointer(counter),
-        encrypt ? 1 : 0,
-      ),
-    );
-
-    const bufSize = 4096;
-
-    // Allocate an input buffer
-    final inBuf = scope<ffi.Uint8>(bufSize);
-    final inData = inBuf.asTypedList(bufSize);
-
-    // Allocate an output buffer, notice that BoringSSL says output cannot be
-    // more than input size + blockSize - 1
-    final outBuf = scope<ffi.Uint8>(bufSize + blockSize);
-    final outData = outBuf.asTypedList(bufSize + blockSize);
-
-    // Allocate and output length integer
-    final outLen = scope<ffi.Int>();
-
-    // Process data from source
-    var isBeforeWrapAround = true;
-    await for (final data in source) {
-      var offset = 0; // offset in data that we have consumed up-to.
-      while (offset < data.length) {
-        int M; // Number of bytes consumed in this iteration
-        if (isBeforeWrapAround) {
-          // Do not consume more bytes than allowed before wrap-around.
-          M = math.min(bytes_until_wraparound.toInt(), data.length - offset);
-          bytes_until_wraparound -= BigInt.from(M);
-        } else {
-          M = data.length - offset;
-          // Do not consume more bytes than allowed after wrap-around
-          if (bytes_after_wraparound.toInt() < M) {
-            throw const FormatException(
-              'input is too large for the counter length',
-            );
-          }
-          bytes_after_wraparound -= BigInt.from(M);
-        }
-
-        // Consume the first M bytes from data.
-        var i = 0; // Number of bytes consumed, after offset
-        while (i < M) {
-          final N = math.min(M, bufSize);
-          inData.setAll(0, data.skip(offset + i).take(N));
-
-          _checkOpIsOne(ssl.EVP_CipherUpdate(ctx, outBuf, outLen, inBuf, N));
-          if (outLen.value > 0) {
-            yield outData.sublist(0, outLen.value);
-          }
-          i += N;
-        }
-        assert(i == M);
-        offset += M;
-
-        // Check if it's time to wrap-around
-        if (isBeforeWrapAround && bytes_until_wraparound == BigInt.zero) {
-          // Output final block of data before wrap-around
-          _checkOpIsOne(ssl.EVP_CipherFinal_ex(ctx, outBuf, outLen));
-          if (outLen.value > 0) {
-            yield outData.sublist(0, outLen.value);
-          }
-
-          final counterWrappedAround = scope.dataAsPointer<ffi.Uint8>(counter);
-          // Zero out the [length] right-most bits of [counterWrappedAround].
-          final c = counterWrappedAround.asTypedList(16);
-          final remainder_bits = length % 8;
-          final counter_bytes = length ~/ 8;
-          c.fillRange(c.length - counter_bytes, c.length, 0);
-          if (remainder_bits != 0) {
-            c[c.length - counter_bytes - 1] &= 0xff & (0xff << remainder_bits);
-          }
-
-          // Re-initialize the cipher context with counter wrapped around.
-          _checkOpIsOne(
-            ssl.EVP_CipherInit_ex(
-              ctx,
-              cipher,
-              ffi.nullptr,
-              scope.dataAsPointer(key),
-              counterWrappedAround,
-              encrypt ? 1 : 0,
-            ),
+  await for (final chunk in source) {
+    var offset = 0;
+    final len = chunk.length;
+    while (offset < len) {
+      int M;
+      if (isBeforeWrapAround) {
+        M = math.min(bytesUntilWraparound.toInt(), chunk.length - offset);
+        bytesUntilWraparound -= BigInt.from(M);
+      } else {
+        M = chunk.length - offset;
+        if (bytesAfterWraparound.toInt() < M) {
+          throw const FormatException(
+            'input is too large for the counter length',
           );
-
-          // Update state
-          isBeforeWrapAround = false;
         }
+        bytesAfterWraparound -= BigInt.from(M);
+      }
+
+      final part = chunk.sublist(offset, offset + M);
+      yield ctx.update(Uint8List.fromList(part));
+      offset += M;
+
+      if (isBeforeWrapAround && bytesUntilWraparound == BigInt.zero) {
+        yield ctx.finish();
+
+        final c = Uint8List.fromList(counter);
+        final legacyCounterBytes = length ~/ 8;
+        c.fillRange(16 - legacyCounterBytes, 16, 0);
+        final remainderBits = length % 8;
+        if (remainderBits != 0) {
+          c[16 - legacyCounterBytes - 1] &= 0xff & (0xff << remainderBits);
+        }
+
+        ctx = encrypt
+            ? ssl.AesCtr.startEncrypt(key, c)
+            : ssl.AesCtr.startDecrypt(key, c);
+        isBeforeWrapAround = false;
       }
     }
-
-    // Output final block
-    _checkOpIsOne(ssl.EVP_CipherFinal_ex(ctx, outBuf, outLen));
-    if (outLen.value > 0) {
-      yield outData.sublist(0, outLen.value);
-    }
-  });
+  }
+  yield ctx.finish();
 }
 
 final class _StaticAesCtrSecretKeyImpl implements StaticAesCtrSecretKeyImpl {
@@ -239,10 +157,23 @@ final class _AesCtrSecretKeyImpl implements AesCtrSecretKeyImpl {
     List<int> counter,
     int length,
   ) async {
-    _checkArguments(counter, length);
-    return await _bufferStream(
-      decryptStream(Stream.value(data), counter, length),
-    );
+    try {
+      _checkArguments(counter, length);
+      final stream = decryptStream(Stream.value(data), counter, length);
+      final chunks = await stream.toList();
+      if (chunks.isEmpty) return Uint8List(0);
+      if (chunks.length == 1) return chunks.first;
+      final total = chunks.fold(0, (sum, c) => sum + c.length);
+      final res = Uint8List(total);
+      var offset = 0;
+      for (final c in chunks) {
+        res.setAll(offset, c);
+        offset += c.length;
+      }
+      return res;
+    } catch (e) {
+      throw operationError('AES-CTR decrypt failed: $e');
+    }
   }
 
   @override
@@ -251,8 +182,12 @@ final class _AesCtrSecretKeyImpl implements AesCtrSecretKeyImpl {
     List<int> counter,
     int length,
   ) {
-    _checkArguments(counter, length);
-    return _aesCtrEncryptOrDecrypt(_key, false, data, counter, length);
+    try {
+      _checkArguments(counter, length);
+      return _aesCtrEncryptOrDecrypt(_key, false, data, counter, length);
+    } catch (e) {
+      throw operationError('AES-CTR decrypt failed: $e');
+    }
   }
 
   @override
@@ -261,10 +196,23 @@ final class _AesCtrSecretKeyImpl implements AesCtrSecretKeyImpl {
     List<int> counter,
     int length,
   ) async {
-    _checkArguments(counter, length);
-    return await _bufferStream(
-      encryptStream(Stream.value(data), counter, length),
-    );
+    try {
+      _checkArguments(counter, length);
+      final stream = encryptStream(Stream.value(data), counter, length);
+      final chunks = await stream.toList();
+      if (chunks.isEmpty) return Uint8List(0);
+      if (chunks.length == 1) return chunks.first;
+      final total = chunks.fold(0, (sum, c) => sum + c.length);
+      final res = Uint8List(total);
+      var offset = 0;
+      for (final c in chunks) {
+        res.setAll(offset, c);
+        offset += c.length;
+      }
+      return res;
+    } catch (e) {
+      throw operationError('AES-CTR encrypt failed: $e');
+    }
   }
 
   @override
@@ -273,8 +221,12 @@ final class _AesCtrSecretKeyImpl implements AesCtrSecretKeyImpl {
     List<int> counter,
     int length,
   ) {
-    _checkArguments(counter, length);
-    return _aesCtrEncryptOrDecrypt(_key, true, data, counter, length);
+    try {
+      _checkArguments(counter, length);
+      return _aesCtrEncryptOrDecrypt(_key, true, data, counter, length);
+    } catch (e) {
+      throw operationError('AES-CTR encrypt failed: $e');
+    }
   }
 
   @override

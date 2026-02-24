@@ -14,229 +14,13 @@
 
 part of 'impl_ffi.dart';
 
-_EvpPKey _importPkcs8RsaPrivateKey(List<int> keyData) {
-  return _Scope.sync((scope) {
-    final k = ssl.EVP_parse_private_key(scope.createCBS(keyData));
-    _checkData(k.address != 0, fallback: 'unable to parse key');
-    final key = _EvpPKey.wrap(k);
-
-    _checkData(
-      ssl.EVP_PKEY_id.invoke(key) == EVP_PKEY_RSA,
-      message: 'key is not an RSA key',
-    );
-
-    final rsa = ssl.EVP_PKEY_get1_RSA.invoke(key);
-    _checkData(rsa.address != 0, fallback: 'key is not an RSA key');
-    scope.defer(() => ssl.RSA_free(rsa));
-
-    _checkData(ssl.RSA_check_key(rsa) == 1, fallback: 'invalid key');
-
-    return key;
-  });
-}
-
-_EvpPKey _importSpkiRsaPublicKey(List<int> keyData) {
-  return _Scope.sync((scope) {
-    final k = ssl.EVP_parse_public_key(scope.createCBS(keyData));
-    _checkData(k.address != 0, fallback: 'unable to parse key');
-    final key = _EvpPKey.wrap(k);
-
-    _checkData(
-      ssl.EVP_PKEY_id.invoke(key) == EVP_PKEY_RSA,
-      message: 'key is not an RSA key',
-    );
-
-    final rsa = ssl.EVP_PKEY_get1_RSA.invoke(key);
-    _checkData(rsa.address != 0, fallback: 'key is not an RSA key');
-    scope.defer(() => ssl.RSA_free(rsa));
-
-    _checkData(ssl.RSA_check_key(rsa) == 1, fallback: 'invalid key');
-
-    return key;
-  });
-}
-
-_EvpPKey _importJwkRsaPrivateOrPublicKey(
-  JsonWebKey jwk, {
-  required bool isPrivateKey,
-  required String expectedAlg,
-  required String expectedUse,
-}) {
-  return _Scope.sync((scope) {
-    void checkJwk(
-      bool condition,
-      String prop, [
-      String message = 'must be present',
-    ]) => _checkData(condition, message: 'JWK property "$prop" $message');
-
-    checkJwk(jwk.kty == 'RSA', 'kty', 'must be "RSA"');
-    checkJwk(
-      jwk.alg == null || jwk.alg == expectedAlg,
-      'alg',
-      'must be "$expectedAlg", if present',
-    );
-    checkJwk(
-      jwk.use == null || jwk.use == expectedUse,
-      'use',
-      'must be "$expectedUse", if present',
-    );
-
-    // TODO: Consider rejecting private keys with 'use', as it's only valid for
-    //       public keys according to the RFC -- maybe read the RFC again to be
-    //       perfectly sure this is correct behavior.
-    //       Also the web crypto spec on this, which says to reject invalid 'use'
-    // TODO: Consider rejecting keys with key_ops inconsistent with isPrivateKey
-    //       See also JWK import logic for EC keys
-
-    ffi.Pointer<BIGNUM> readBN(String value, String prop) {
-      final bin = _jwkDecodeBase64UrlNoPadding(value, prop);
-      checkJwk(bin.isNotEmpty, prop, 'must not be empty');
-      checkJwk(
-        bin.length == 1 || bin[0] != 0,
-        prop,
-        'must not have leading zeros',
-      );
-      return scope.create(
-        () => ssl.BN_bin2bn(scope.dataAsPointer(bin), bin.length, ffi.nullptr),
-        ssl.BN_free,
-      );
-    }
-
-    final rsa = scope.createRSA();
-
-    checkJwk(jwk.n != null, 'n');
-    checkJwk(jwk.e != null, 'e');
-    final n = readBN(jwk.n!, 'n');
-    final e = readBN(jwk.e!, 'e');
-    _checkOpIsOne(ssl.RSA_set0_key(rsa, n, e, ffi.nullptr));
-    scope.move(n); // ssl.RSA_set0_key takes ownership
-    scope.move(e);
-
-    if (isPrivateKey) {
-      // The "p", "q", "dp", "dq", and "qi" properties are optional in the JWA
-      // spec. However they are required by Chromium's WebCrypto implementation.
-      checkJwk(jwk.d != null, 'd');
-      final d = readBN(jwk.d!, 'd');
-      // If present properties p,q,dp,dq,qi enable optional optimizations, see:
-      // https://www.rfc-editor.org/rfc/rfc7518#section-6.3.2
-      // However, these are required by Chromes Web Crypto implementation:
-      // https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/rsa.cc#82
-      // They are also required by Web Crypto implementation in Firefox:
-      // https://hg.mozilla.org/mozilla-central/file/38e6ad5fd7535be88e432075f76ec4a2dc294672/dom/crypto/CryptoKey.cpp#l588
-      // We follow this precedence because (a) having optimizations is nice,
-      // and, (b) following Chromes/Firefox behavior is safe.
-      // Notice, we can choose to support this in the future without breaking
-      // the public API.
-      checkJwk(jwk.p != null, 'p');
-      checkJwk(jwk.q != null, 'q');
-      checkJwk(jwk.dp != null, 'dp');
-      checkJwk(jwk.dq != null, 'dq');
-      checkJwk(jwk.qi != null, 'qi');
-      final p = readBN(jwk.p!, 'p');
-      final q = readBN(jwk.q!, 'q');
-      final dp = readBN(jwk.dp!, 'dp');
-      final dq = readBN(jwk.dq!, 'dq');
-      final qi = readBN(jwk.qi!, 'qi');
-
-      _checkOpIsOne(ssl.RSA_set0_key(rsa, ffi.nullptr, ffi.nullptr, d));
-      scope.move(d); // ssl.RSA_set0_key takes ownership
-
-      _checkOpIsOne(ssl.RSA_set0_factors(rsa, p, q));
-      scope.move(p); // ssl.RSA_set0_factors takes ownership
-      scope.move(q);
-
-      _checkOpIsOne(ssl.RSA_set0_crt_params(rsa, dp, dq, qi));
-      scope.move(dp); // ssl.RSA_set0_crt_params takes ownership
-      scope.move(dq);
-      scope.move(qi);
-
-      // Notice that 'jwk.oth' isn't supported by Chrome:
-      // https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/rsa.cc#31
-      // This also appears to be ignored by Firefox:
-      // https://hg.mozilla.org/mozilla-central/file/38e6ad5fd7535be88e432075f76ec4a2dc294672/dom/crypto/CryptoKey.cpp#l588
-      // Thus, we follow Chrome and ignore property.
-    }
-
-    _checkDataIsOne(ssl.RSA_check_key(rsa), fallback: 'invalid RSA key');
-
-    final key = _EvpPKey();
-    _checkOpIsOne(ssl.EVP_PKEY_set1_RSA.invoke(key, rsa));
-
-    return key;
-  });
-}
-
-Map<String, dynamic> _exportJwkRsaPrivateOrPublicKey(
-  _EvpPKey key, {
-  required bool isPrivateKey,
-  required String jwkAlg,
-  required String jwkUse,
-}) {
-  return _Scope.sync((scope) {
-    final rsa = ssl.EVP_PKEY_get1_RSA.invoke(key);
-    _checkOp(rsa.address != 0, fallback: 'internal key type error');
-    scope.defer(() => ssl.RSA_free(rsa));
-
-    String encodeBN(ffi.Pointer<BIGNUM> bn) {
-      final N = ssl.BN_num_bytes(bn);
-      final out = scope<ffi.Uint8>(N);
-      _checkOpIsOne(ssl.BN_bn2bin_padded(out, N, bn));
-      final result = out.copy(N);
-      assert(result.length == 1 || result[0] != 0);
-      return _jwkEncodeBase64UrlNoPadding(result);
-    }
-
-    // Public key parameters
-    final n = scope<ffi.Pointer<BIGNUM>>();
-    final e = scope<ffi.Pointer<BIGNUM>>();
-    ssl.RSA_get0_key(rsa, n, e, ffi.nullptr);
-
-    if (!isPrivateKey) {
-      return JsonWebKey(
-        kty: 'RSA',
-        use: jwkUse,
-        alg: jwkAlg,
-        n: encodeBN(n.value),
-        e: encodeBN(e.value),
-      ).toJson();
-    }
-
-    final d = scope<ffi.Pointer<BIGNUM>>();
-    ssl.RSA_get0_key(rsa, ffi.nullptr, ffi.nullptr, d);
-
-    // p, q, dp, dq, qi is optional in:
-    // // https://www.rfc-editor.org/rfc/rfc7518#section-6.3.2
-    // but explicitly required when exporting in Web Crypto.
-    final p = scope<ffi.Pointer<BIGNUM>>();
-    final q = scope<ffi.Pointer<BIGNUM>>();
-    ssl.RSA_get0_factors(rsa, p, q);
-
-    final dp = scope<ffi.Pointer<BIGNUM>>();
-    final dq = scope<ffi.Pointer<BIGNUM>>();
-    final qi = scope<ffi.Pointer<BIGNUM>>();
-    ssl.RSA_get0_crt_params(rsa, dp, dq, qi);
-
-    return JsonWebKey(
-      kty: 'RSA',
-      use: jwkUse,
-      alg: jwkAlg,
-      n: encodeBN(n.value),
-      e: encodeBN(e.value),
-      d: encodeBN(d.value),
-      p: encodeBN(p.value),
-      q: encodeBN(q.value),
-      dp: encodeBN(dp.value),
-      dq: encodeBN(dq.value),
-      qi: encodeBN(qi.value),
-    ).toJson();
-  });
-}
-
-Future<KeyPair<_EvpPKey, _EvpPKey>> _generateRsaKeyPair(
+Future<KeyPair<S, T>> _generateRsaKeyPair<S, T>(
   int modulusLength,
   BigInt publicExponent,
+  // Helper factories to create the specific implementation instances
+  S Function(ssl.RsaKey) privateKeyFactory,
+  T Function(ssl.RsaKey) publicKeyFactory,
 ) async {
-  // Sanity check for the modulusLength
   if (modulusLength < 256 || modulusLength > 16384) {
     throw UnsupportedError(
       'modulusLength must between 256 and 16k, $modulusLength is not supported',
@@ -247,55 +31,108 @@ Future<KeyPair<_EvpPKey, _EvpPKey>> _generateRsaKeyPair(
       'modulusLength: $modulusLength is not a multiple of 8',
     );
   }
-
-  // Limit publicExponent allow-listed as in chromium:
-  // https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/rsa.cc#286
   if (publicExponent != BigInt.from(3) &&
       publicExponent != BigInt.from(65537)) {
     throw UnsupportedError('publicExponent is not supported, try 3 or 65537');
   }
 
-  return _Scope.async((scope) async {
-    // Generate private RSA key
-    final privRSA = scope.createRSA();
+  // Generate in Isolate to avoid blocking
+  final pkcs8 = await Isolate.run(() {
+    // We pass modulusLength and publicExponent (BigInt is sendable)
+    final key = ssl.RsaKey.generate(modulusLength, publicExponent);
+    return key.exportPkcs8();
+  }, debugName: 'RSA_generate');
 
-    final e = scope.createBN();
-    _checkOpIsOne(ssl.BN_set_word(e, publicExponent.toInt()));
+  // Import on main isolate
+  final privateKey = ssl.RsaKey.importPkcs8(pkcs8);
 
-    _checkOpIsOne(
-      await _RSA_generate_key_ex(privRSA, modulusLength, e, ffi.nullptr),
-    );
+  // Derive public key (via SPKI export/import to separate objects)
+  final spki = privateKey.exportSpki();
+  final publicKey = ssl.RsaKey.importSpki(spki);
 
-    // Copy out the public RSA key
-    final pubRSA = scope.create(
-      () => ssl.RSAPublicKey_dup(privRSA),
-      ssl.RSA_free,
-    );
-
-    // Create private key
-    final privKey = _EvpPKey();
-    _checkOp(ssl.EVP_PKEY_set1_RSA.invoke(privKey, privRSA) == 1);
-
-    // Create public key
-    final pubKey = _EvpPKey();
-    _checkOp(ssl.EVP_PKEY_set1_RSA.invoke(pubKey, pubRSA) == 1);
-
-    return (privateKey: privKey, publicKey: pubKey);
-  });
+  return (
+    privateKey: privateKeyFactory(privateKey),
+    publicKey: publicKeyFactory(publicKey),
+  );
 }
 
-/// Helper function to run `ssl.RSA_generate_key_ex` in an [Isolate]
-/// using [Isolate.run].
-///
-/// Using this auxiliary function to wrap the call should reduce the risk that
-/// unnecessary variables are copied into the closure passed to [Isolate.run].
-// ignore: non_constant_identifier_names
-Future<int> _RSA_generate_key_ex(
-  ffi.Pointer<RSA> rsa,
-  int bits,
-  ffi.Pointer<BIGNUM> e,
-  ffi.Pointer<BN_GENCB> cb,
-) async => await Isolate.run(
-  () => ssl.RSA_generate_key_ex(rsa, bits, e, cb),
-  debugName: 'RSA_generate_key_ex',
-);
+// Helpers for JWK
+void _checkJwkRsa(
+  JsonWebKey jwk, {
+  required bool isPrivateKey,
+  required String expectedAlg,
+  required String expectedUse,
+}) {
+  if (jwk.kty != 'RSA') {
+    throw const FormatException('JWK "kty" must be "RSA"');
+  }
+  if (jwk.alg != null && jwk.alg != expectedAlg) {
+    throw FormatException('JWK "alg" must be "$expectedAlg"');
+  }
+  if (jwk.use != null && jwk.use != expectedUse) {
+    throw FormatException('JWK "use" must be "$expectedUse"');
+  }
+  if (jwk.n == null || jwk.e == null) {
+    throw const FormatException('JWK "n" and "e" must be present');
+  }
+  if (isPrivateKey) {
+    if (jwk.d == null) {
+      throw const FormatException('JWK "d" must be present for private keys');
+    }
+    if (jwk.p == null ||
+        jwk.q == null ||
+        jwk.dp == null ||
+        jwk.dq == null ||
+        jwk.qi == null) {
+      throw const FormatException(
+        'JWK "p", "q", "dp", "dq", "qi" must be present for private keys',
+      );
+    }
+  } else {
+    if (jwk.d != null) {
+      throw const FormatException(
+        'JWK "d" must not be present for public keys',
+      );
+    }
+  }
+}
+
+ssl.RsaKey _importJwkRsa(JsonWebKey jwk, {required bool isPrivateKey}) {
+  Uint8List d(String? s) =>
+      s != null ? _jwkDecodeBase64UrlNoPadding(s, '') : Uint8List(0);
+
+  return ssl.RsaKey.importComponents(
+    n: d(jwk.n),
+    e: d(jwk.e),
+    d: isPrivateKey ? d(jwk.d) : null,
+    p: isPrivateKey ? d(jwk.p) : null,
+    q: isPrivateKey ? d(jwk.q) : null,
+    dp: isPrivateKey ? d(jwk.dp) : null,
+    dq: isPrivateKey ? d(jwk.dq) : null,
+    qi: isPrivateKey ? d(jwk.qi) : null,
+  );
+}
+
+Map<String, dynamic> _exportJwkRsa(
+  ssl.RsaKey key, {
+  required bool isPrivateKey,
+  required String jwkAlg,
+  required String jwkUse,
+}) {
+  final c = key.exportComponents(includePrivate: isPrivateKey);
+  String e(String k) => c[k] != null ? _jwkEncodeBase64UrlNoPadding(c[k]!) : '';
+
+  return JsonWebKey(
+    kty: 'RSA',
+    use: jwkUse,
+    alg: jwkAlg,
+    n: e('n'),
+    e: e('e'),
+    d: isPrivateKey ? e('d') : null,
+    p: isPrivateKey ? e('p') : null,
+    q: isPrivateKey ? e('q') : null,
+    dp: isPrivateKey ? e('dp') : null,
+    dq: isPrivateKey ? e('dq') : null,
+    qi: isPrivateKey ? e('qi') : null,
+  ).toJson();
+}

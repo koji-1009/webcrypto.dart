@@ -19,52 +19,89 @@ part of 'impl_ffi.dart';
 Future<EcdhPrivateKeyImpl> ecdhPrivateKey_importPkcs8Key(
   List<int> keyData,
   EllipticCurve curve,
-) async => _EcdhPrivateKeyImpl(_importPkcs8EcPrivateKey(keyData, curve));
+) async {
+  return _EcdhPrivateKeyImpl(
+    ssl.EcKey.importPkcs8(Uint8List.fromList(keyData), _ecCurveName(curve)),
+  );
+}
 
 Future<EcdhPrivateKeyImpl> ecdhPrivateKey_importJsonWebKey(
   Map<String, dynamic> jwk,
   EllipticCurve curve,
-) async => _EcdhPrivateKeyImpl(
-  _importJwkEcPrivateOrPublicKey(
-    JsonWebKey.fromJson(jwk),
-    curve,
+) async {
+  final k = JsonWebKey.fromJson(jwk);
+  _checkJwkEc(
+    k,
     isPrivateKey: true,
     expectedUse: 'enc',
-    expectedAlg: null, // ECDH has no validation of 'jwk.alg'
-  ),
-);
+    curveName: _ecCurveName(curve),
+    expectedAlg: null,
+  );
+  return _EcdhPrivateKeyImpl(_importJwkEc(k, curve, isPrivateKey: true));
+}
 
 Future<KeyPair<EcdhPrivateKeyImpl, EcdhPublicKeyImpl>>
 ecdhPrivateKey_generateKey(EllipticCurve curve) async {
-  final p = _generateEcKeyPair(curve);
+  final key = ssl.EcKey.generate(_ecCurveName(curve));
+
+  // Clone public key logic (same as ECDSA)
+  final coords = key.exportCoordinates();
+  final pubKey = ssl.EcKey.importCoordinates(
+    curve: key.curve,
+    x: coords['x']!,
+    y: coords['y']!,
+  );
+
   return (
-    privateKey: _EcdhPrivateKeyImpl(p.privateKey),
-    publicKey: _EcdhPublicKeyImpl(p.publicKey),
+    privateKey: _EcdhPrivateKeyImpl(key),
+    publicKey: _EcdhPublicKeyImpl(pubKey),
   );
 }
 
 Future<EcdhPublicKeyImpl> ecdhPublicKey_importRawKey(
   List<int> keyData,
   EllipticCurve curve,
-) async => _EcdhPublicKeyImpl(_importRawEcPublicKey(keyData, curve));
+) async {
+  // Manual raw parsing
+  final k = Uint8List.fromList(keyData);
+  if (k.isEmpty || k[0] != 0x04) {
+    throw ArgumentError('Invalid raw EC key format (must be 0x04)');
+  }
+  if ((k.length - 1) % 2 != 0) {
+    throw ArgumentError('Invalid raw EC key length');
+  }
+  final coordLen = (k.length - 1) ~/ 2;
+  final x = k.sublist(1, 1 + coordLen);
+  final y = k.sublist(1 + coordLen);
+
+  return _EcdhPublicKeyImpl(
+    ssl.EcKey.importCoordinates(curve: _ecCurveName(curve), x: x, y: y),
+  );
+}
 
 Future<EcdhPublicKeyImpl> ecdhPublicKey_importSpkiKey(
   List<int> keyData,
   EllipticCurve curve,
-) async => _EcdhPublicKeyImpl(_importSpkiEcPublicKey(keyData, curve));
+) async {
+  return _EcdhPublicKeyImpl(
+    ssl.EcKey.importSpki(Uint8List.fromList(keyData), _ecCurveName(curve)),
+  );
+}
 
 Future<EcdhPublicKeyImpl> ecdhPublicKey_importJsonWebKey(
   Map<String, dynamic> jwk,
   EllipticCurve curve,
-) async => _EcdhPublicKeyImpl(
-  _importJwkEcPrivateOrPublicKey(
-    JsonWebKey.fromJson(jwk),
-    curve,
+) async {
+  final k = JsonWebKey.fromJson(jwk);
+  _checkJwkEc(
+    k,
     isPrivateKey: false,
     expectedUse: 'enc',
-    expectedAlg: null, // ECDH has no validation of 'jwk.alg'
-  ),
-);
+    curveName: _ecCurveName(curve),
+    expectedAlg: null,
+  );
+  return _EcdhPublicKeyImpl(_importJwkEc(k, curve, isPrivateKey: false));
+}
 
 final class _StaticEcdhPrivateKeyImpl implements StaticEcdhPrivateKeyImpl {
   const _StaticEcdhPrivateKeyImpl();
@@ -85,16 +122,13 @@ final class _StaticEcdhPrivateKeyImpl implements StaticEcdhPrivateKeyImpl {
   Future<(EcdhPrivateKeyImpl, EcdhPublicKeyImpl)> generateKey(
     EllipticCurve curve,
   ) async {
-    final KeyPair<EcdhPrivateKeyImpl, EcdhPublicKeyImpl> keyPair =
-        await ecdhPrivateKey_generateKey(curve);
-
+    final keyPair = await ecdhPrivateKey_generateKey(curve);
     return (keyPair.privateKey, keyPair.publicKey);
   }
 }
 
 final class _EcdhPrivateKeyImpl implements EcdhPrivateKeyImpl {
-  final _EvpPKey _key;
-
+  final ssl.EcKey _key;
   _EcdhPrivateKeyImpl(this._key);
 
   @override
@@ -108,88 +142,29 @@ final class _EcdhPrivateKeyImpl implements EcdhPrivateKeyImpl {
       throw ArgumentError.value(
         publicKey,
         'publicKey',
-        'custom implementations of EcdhPublicKey is not supported',
+        'unsupported key implementation',
       );
     }
-    if (length <= 0) {
-      throw ArgumentError.value(length, 'length', 'must be positive');
+    final pubKey = publicKey._key;
+
+    // Check curves match?
+    if (pubKey.curve != _key.curve) {
+      throw ArgumentError('Curves mismatch');
     }
 
-    return _Scope.async((scope) async {
-      final pubEcKey = ssl.EVP_PKEY_get1_EC_KEY.invoke(publicKey._key);
-      _checkOp(pubEcKey.address != 0, fallback: 'not an ec key');
-      scope.defer(() => ssl.EC_KEY_free(pubEcKey));
-
-      final privEcKey = ssl.EVP_PKEY_get1_EC_KEY.invoke(_key);
-      _checkOp(privEcKey.address != 0, fallback: 'not an ec key');
-      scope.defer(() => ssl.EC_KEY_free(privEcKey));
-
-      // Check that public/private key uses the same elliptic curve.
-      if (ssl.EC_GROUP_get_curve_name(ssl.EC_KEY_get0_group(pubEcKey)) !=
-          ssl.EC_GROUP_get_curve_name(ssl.EC_KEY_get0_group(privEcKey))) {
-        // Note: web crypto will throw an InvalidAccessError here.
-        throw ArgumentError.value(
-          publicKey,
-          'publicKey',
-          'Public and private key for ECDH key derivation have the same '
-              'elliptic curve',
-        );
-      }
-
-      // Field size rounded up to 8 bits is the maximum number of bits we can
-      // derive. The most significant bits will be zero in this case.
-      final fieldSize = ssl.EC_GROUP_get_degree(
-        ssl.EC_KEY_get0_group(privEcKey),
-      );
-      final maxLength = 8 * (fieldSize / 8).ceil();
-      if (length > maxLength) {
-        throw operationError(
-          'Length in ECDH key derivation is too large. '
-          'Maximum allowed is $maxLength bits.',
-        );
-      }
-
-      if (length == 0) {
-        return Uint8List.fromList(const []);
-      }
-
-      final lengthInBytes = (length / 8).ceil();
-      final out = scope<ffi.Uint8>(lengthInBytes);
-      final outLen = ssl.ECDH_compute_key(
-        out.cast(),
-        lengthInBytes,
-        ssl.EC_KEY_get0_public_key(pubEcKey),
-        privEcKey,
-        ffi.nullptr,
-      );
-      _checkOp(outLen != -1, fallback: 'ECDH key derivation failed');
-      _checkOp(
-        outLen == lengthInBytes,
-        message: 'internal error in ECDH key derivation',
-      );
-      final derived = out.copy(lengthInBytes);
-
-      // Only return the first [length] bits from derived.
-      final zeroBits = lengthInBytes * 8 - length;
-      assert(zeroBits < 8);
-      if (zeroBits > 0) {
-        derived.last &= ((0xff << zeroBits) & 0xff);
-      }
-
-      return derived;
-    });
+    try {
+      return ssl.Ecdh.computeBits(_key, pubKey, length);
+    } catch (e) {
+      throw operationError('ECDH deriveBits failed: $e');
+    }
   }
 
   @override
   Future<Map<String, dynamic>> exportJsonWebKey() async =>
-      // Neither Chrome or Firefox produces 'use': 'enc' for ECDH, we choose to
-      // omit it for better interoperability. Chrome incorrectly forbids during
-      // import (though we strip 'use' to mitigate this).
-      // See also: https://crbug.com/641499 (and importJsonWebKey in JS)
-      _exportJwkEcPrivateOrPublicKey(_key, isPrivateKey: true, jwkUse: null);
+      _exportJwkEc(_key, isPrivateKey: true, jwkUse: 'enc');
 
   @override
-  Future<Uint8List> exportPkcs8Key() async => _exportPkcs8Key(_key);
+  Future<Uint8List> exportPkcs8Key() async => _key.exportPkcs8();
 }
 
 final class _StaticEcdhPublicKeyImpl implements StaticEcdhPublicKeyImpl {
@@ -215,8 +190,7 @@ final class _StaticEcdhPublicKeyImpl implements StaticEcdhPublicKeyImpl {
 }
 
 final class _EcdhPublicKeyImpl implements EcdhPublicKeyImpl {
-  final _EvpPKey _key;
-
+  final ssl.EcKey _key;
   _EcdhPublicKeyImpl(this._key);
 
   @override
@@ -226,15 +200,20 @@ final class _EcdhPublicKeyImpl implements EcdhPublicKeyImpl {
 
   @override
   Future<Map<String, dynamic>> exportJsonWebKey() async =>
-      // Neither Chrome or Firefox produces 'use': 'enc' for ECDH, we choose to
-      // omit it for better interoperability. Chrome incorrectly forbids during
-      // import (though we strip 'use' to mitigate this).
-      // See also: https://crbug.com/641499 (and importJsonWebKey in JS)
-      _exportJwkEcPrivateOrPublicKey(_key, isPrivateKey: false, jwkUse: null);
+      _exportJwkEc(_key, isPrivateKey: false, jwkUse: 'enc');
 
   @override
-  Future<Uint8List> exportRawKey() async => _exportRawEcPublicKey(_key);
+  Future<Uint8List> exportRawKey() async {
+    final coords = _key.exportCoordinates();
+    final x = coords['x']!;
+    final y = coords['y']!;
+    final out = Uint8List(1 + x.length + y.length);
+    out[0] = 0x04;
+    out.setAll(1, x);
+    out.setAll(1 + x.length, y);
+    return out;
+  }
 
   @override
-  Future<Uint8List> exportSpkiKey() async => _exportSpkiKey(_key);
+  Future<Uint8List> exportSpkiKey() async => _key.exportSpki();
 }

@@ -48,41 +48,34 @@ final class _HkdfSecretKeyImpl implements HkdfSecretKeyImpl {
     if (length < 0) {
       throw ArgumentError.value(length, 'length', 'must be positive integer');
     }
-    final md = _HashImpl.fromHash(hash)._md;
-
-    // Mirroring limitations in chromium:
-    // https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/hkdf.cc#74
+    // Mirroring limitations in chromium/legacy code:
     if (length % 8 != 0) {
       throw operationError('The length for HKDF must be a multiple of 8 bits');
     }
 
     final lengthInBytes = length ~/ 8;
+    final h = _HashImpl.fromHash(hash);
 
-    return _Scope.async((scope) async {
-      final out = scope<ffi.Uint8>(lengthInBytes);
-      final r = ssl.HKDF(
-        out,
-        lengthInBytes,
-        md,
-        scope.dataAsPointer(_key),
-        _key.length,
-        scope.dataAsPointer(salt),
-        salt.length,
-        scope.dataAsPointer(info),
-        info.length,
+    try {
+      return ssl.Hkdf.derive(
+        key: _key,
+        salt: Uint8List.fromList(salt),
+        info: Uint8List.fromList(info),
+        length: lengthInBytes,
+        hashAlgorithm: h.hashName,
       );
-      if (r != 1) {
-        final packed_error = ssl.ERR_peek_error();
-        if (ERR_GET_LIB(packed_error) == ERR_LIB_HKDF &&
-            ERR_GET_REASON(packed_error) == HKDF_R_OUTPUT_TOO_LARGE) {
-          ssl.ERR_clear_error();
-          throw operationError(
-            'Length specified for HkdfSecretKey.deriveBits is too long',
-          );
-        }
-        _checkOpIsOne(r, fallback: 'HKDF key derivation failed');
+    } on ArgumentError catch (e) {
+      // Convert specific boringssl error if needed (HKDF output too large) to OperationError?
+      // Legacy code threw OperationError on HKDF_R_OUTPUT_TOO_LARGE.
+      // boringssl_dart throws ArgumentError('HKDF output length too large').
+      if (e.message == 'HKDF output length too large') {
+        throw operationError(
+          'Length specified for HkdfSecretKey.deriveBits is too long',
+        );
       }
-      return out.copy(lengthInBytes);
-    });
+      rethrow;
+    } catch (e) {
+      throw operationError('HKDF deriveBits failed: $e');
+    }
   }
 }

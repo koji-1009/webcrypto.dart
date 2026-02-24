@@ -51,10 +51,7 @@ final class _Pbkdf2SecretKeyImpl implements Pbkdf2SecretKeyImpl {
     if (length < 0) {
       throw ArgumentError.value(length, 'length', 'must be positive integer');
     }
-    final md = _HashImpl.fromHash(hash)._md;
-
-    // Mirroring limitations in chromium:
-    // https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/pbkdf2.cc#75
+    // Mirroring limitations in chromium
     if (length % 8 != 0) {
       throw operationError(
         'The length for PBKDF2 must be a multiple of 8 bits',
@@ -72,53 +69,26 @@ final class _Pbkdf2SecretKeyImpl implements Pbkdf2SecretKeyImpl {
     }
 
     final lengthInBytes = length ~/ 8;
+    final h = _HashImpl.fromHash(hash);
 
-    return _Scope.async((scope) async {
-      final out = scope<ffi.Uint8>(lengthInBytes);
-      _checkOpIsOne(
-        await _PKCS5_PBKDF2_HMAC(
-          scope.dataAsPointer(_key),
-          _key.length,
-          scope.dataAsPointer(salt),
-          salt.length,
-          iterations,
-          md,
-          lengthInBytes,
-          out,
+    final saltBytes = Uint8List.fromList(salt);
+    final hashName = h.hashName;
+
+    // Use Isolate.run to avoid blocking main thread for expensive PBKDF2
+    try {
+      return await Isolate.run(
+        () => ssl.Pbkdf2.derive(
+          key: _key,
+          salt: saltBytes,
+          iterations: iterations,
+          length: lengthInBytes,
+          hashAlgorithm: hashName,
         ),
+        debugName: 'PBKDF2',
       );
-      return out.copy(lengthInBytes);
-    });
+    } catch (e) {
+      // Isolate errors might not leave Main Isolate stack dirty, but we need OperationError.
+      throw operationError('PBKDF2 deriveBits failed: $e');
+    }
   }
 }
-
-/// Helper function to run `ssl.PKCS5_PBKDF2_HMAC` in an [Isolate]
-/// using [Isolate.run].
-///
-/// This offloads the computationally expensive PBKDF2 operation to a
-/// separate isolate to avoid blocking the main isolate.
-///
-/// Using this auxiliary function to wrap the call should reduce the risk that
-/// unnecessary variables are copied into the closure passed to [Isolate.run].
-Future<int> _PKCS5_PBKDF2_HMAC(
-  ffi.Pointer<ffi.Char> key,
-  int keyLength,
-  ffi.Pointer<ffi.Uint8> salt,
-  int saltLength,
-  int iterations,
-  ffi.Pointer<EVP_MD> md,
-  int lengthInBytes,
-  ffi.Pointer<ffi.Uint8> out,
-) async => await Isolate.run(
-  () => ssl.PKCS5_PBKDF2_HMAC(
-    key,
-    keyLength,
-    salt,
-    saltLength,
-    iterations,
-    md,
-    lengthInBytes,
-    out,
-  ),
-  debugName: 'PKCS5_PBKDF2_HMAC',
-);

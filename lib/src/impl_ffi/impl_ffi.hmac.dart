@@ -16,22 +16,6 @@
 
 part of 'impl_ffi.dart';
 
-/// Convert [data] to [Uint8List] and zero to [lengthInBits] if given.
-Uint8List _asUint8ListZeroedToBitLength(List<int> data, [int? lengthInBits]) {
-  final buf = Uint8List.fromList(data);
-  if (lengthInBits != null) {
-    final startFrom = (lengthInBits / 8).floor();
-    var remainder = (lengthInBits % 8).toInt();
-    for (var i = startFrom; i < buf.length; i++) {
-      // TODO: This passes tests, but I think this should be >> instead.. hmm...
-      final mask = 0xff & (0xff << (8 - remainder));
-      buf[i] = buf[i] & mask;
-      remainder = 8;
-    }
-  }
-  return buf;
-}
-
 Future<HmacSecretKeyImpl> hmacSecretKey_importRawKey(
   List<int> keyData,
   HashImpl hash, {
@@ -51,8 +35,9 @@ Future<HmacSecretKeyImpl> hmacSecretKey_importJsonWebKey(
   final h = _HashImpl.fromHash(hash);
   final k = JsonWebKey.fromJson(jwk);
 
-  void checkJwk(bool condition, String prop, String message) =>
-      _checkData(condition, message: 'JWK property "$prop" $message');
+  void checkJwk(bool condition, String prop, String message) {
+    if (!condition) throw FormatException('JWK property "$prop" $message');
+  }
 
   checkJwk(k.kty == 'oct', 'kty', 'must be "oct"');
   checkJwk(k.k != null, 'k', 'must be present');
@@ -74,9 +59,10 @@ Future<HmacSecretKeyImpl> hmacSecretKey_generateKey(
   int? length,
 }) async {
   final h = _HashImpl.fromHash(hash);
-  length ??= ssl.EVP_MD_size(h._md) * 8;
+  length ??= h.digestLength * 8;
+
   final keyData = Uint8List((length / 8).ceil());
-  fillRandomBytes(keyData);
+  ssl.getRandomValues(keyData);
 
   return _HmacSecretKeyImpl(_asUint8ListZeroedToBitLength(keyData, length), h);
 }
@@ -103,7 +89,7 @@ final class _StaticHmacSecretKeyImpl implements StaticHmacSecretKeyImpl {
   }
 
   @override
-  Future<HmacSecretKeyImpl> generateKey(HashImpl hash, {int? length = 32}) {
+  Future<HmacSecretKeyImpl> generateKey(HashImpl hash, {int? length}) {
     return hmacSecretKey_generateKey(hash, length: length);
   }
 }
@@ -120,52 +106,33 @@ final class _HmacSecretKeyImpl implements HmacSecretKeyImpl {
   }
 
   @override
-  Future<Uint8List> signBytes(List<int> data) => signStream(Stream.value(data));
-
-  @override
-  Future<Uint8List> signStream(Stream<List<int>> data) {
-    return _Scope.async((scope) async {
-      final ctx = scope.create(ssl.HMAC_CTX_new, ssl.HMAC_CTX_free);
-      _checkOpIsOne(
-        ssl.HMAC_Init_ex(
-          ctx,
-          scope.dataAsPointer(_keyData),
-          _keyData.length,
-          _hash._md,
-          ffi.nullptr,
-        ),
-      );
-
-      await _streamToUpdate(data, ctx, ssl.HMAC_Update);
-
-      final size = ssl.HMAC_size(ctx);
-      _checkOp(size > 0);
-      final psize = scope<ffi.UnsignedInt>();
-      psize.value = size;
-      final out = scope<ffi.Uint8>(size);
-      _checkOpIsOne(ssl.HMAC_Final(ctx, out, psize));
-      return out.copy(psize.value);
-    });
+  Future<Uint8List> signBytes(List<int> data) async {
+    return ssl.Hmac.sign(_keyData, Uint8List.fromList(data), _hash.hashName);
   }
 
   @override
-  Future<bool> verifyBytes(List<int> signature, List<int> data) =>
-      verifyStream(signature, Stream.value(data));
+  Future<Uint8List> signStream(Stream<List<int>> data) async {
+    final signer = ssl.HmacSigner(_keyData, _hash.hashName);
+    await for (final chunk in data) {
+      signer.update(Uint8List.fromList(chunk));
+    }
+    return signer.finish();
+  }
+
+  @override
+  Future<bool> verifyBytes(List<int> signature, List<int> data) async {
+    return ssl.Hmac.verify(
+      _keyData,
+      Uint8List.fromList(signature),
+      Uint8List.fromList(data),
+      _hash.hashName,
+    );
+  }
 
   @override
   Future<bool> verifyStream(List<int> signature, Stream<List<int>> data) async {
-    final other = await signStream(data);
-    if (signature.length != other.length) {
-      return false;
-    }
-    return _Scope.sync((scope) {
-      final cmp = ssl.CRYPTO_memcmp(
-        scope.dataAsPointer(signature),
-        scope.dataAsPointer(other),
-        other.length,
-      );
-      return cmp == 0;
-    });
+    final computed = await signStream(data);
+    return ssl.constantTimeEq(Uint8List.fromList(signature), computed);
   }
 
   @override

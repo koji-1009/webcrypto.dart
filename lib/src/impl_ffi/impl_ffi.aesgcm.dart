@@ -27,91 +27,6 @@ Future<AesGcmSecretKeyImpl> aesGcm_importJsonWebKey(
 Future<AesGcmSecretKeyImpl> aesGcm_generateKey(int length) async =>
     _AesGcmSecretKeyImpl(_aesGenerateKey(length));
 
-Future<Uint8List> _aesGcmEncryptDecrypt(
-  List<int> key,
-  List<int> data,
-  List<int> iv,
-  List<int>? additionalData,
-  int tagLength,
-  bool isEncrypt,
-) async {
-  final additionalData_ = additionalData ??= <int>[];
-  if (isEncrypt && data.length > (1 << 39) - 256) {
-    // More than this is not allowed by Web crypto spec, we shall honor that.
-    throw operationError('data may not be more than 2^39 - 256 bytes');
-  }
-  if (tagLength != 32 &&
-      tagLength != 64 &&
-      tagLength != 96 &&
-      tagLength != 104 &&
-      tagLength != 112 &&
-      tagLength != 120 &&
-      tagLength != 128) {
-    throw operationError('tagLength must be 32, 64, 96, 104, 112, 120 or 128');
-  }
-
-  // TODO: Check iv length is less than EVP_AEAD_nonce_length, if this is a requirement!
-  //       More importantly, add some test cases covering this, also consider
-  //       what chrome does, how firefox passes tests. And check if other
-  //       primitives that accept an iv/nonce has size limitations on it.
-
-  return _Scope.async((scope) async {
-    assert(key.length == 16 || key.length == 32);
-    final aead = key.length == 16
-        ? ssl.EVP_aead_aes_128_gcm()
-        : ssl.EVP_aead_aes_256_gcm();
-
-    final ctx = scope.create(
-      () => ssl.EVP_AEAD_CTX_new(
-        aead,
-        scope.dataAsPointer(key),
-        key.length,
-        tagLength ~/ 8,
-      ),
-      ssl.EVP_AEAD_CTX_free,
-    );
-
-    if (isEncrypt) {
-      final outLen = scope<ffi.Size>();
-      final maxOut = data.length + ssl.EVP_AEAD_max_overhead(aead);
-      final out = scope<ffi.Uint8>(maxOut);
-      _checkOpIsOne(
-        ssl.EVP_AEAD_CTX_seal(
-          ctx,
-          out,
-          outLen,
-          maxOut,
-          scope.dataAsPointer(iv),
-          iv.length,
-          scope.dataAsPointer(data),
-          data.length,
-          scope.dataAsPointer(additionalData_),
-          additionalData_.length,
-        ),
-      );
-      return out.copy(outLen.value);
-    } else {
-      final outLen = scope<ffi.Size>();
-      final out = scope<ffi.Uint8>(data.length);
-      _checkOpIsOne(
-        ssl.EVP_AEAD_CTX_open(
-          ctx,
-          out,
-          outLen,
-          data.length,
-          scope.dataAsPointer(iv),
-          iv.length,
-          scope.dataAsPointer(data),
-          data.length,
-          scope.dataAsPointer(additionalData_),
-          additionalData_.length,
-        ),
-      );
-      return out.copy(outLen.value);
-    }
-  });
-}
-
 final class _StaticAesGcmSecretKeyImpl implements StaticAesGcmSecretKeyImpl {
   const _StaticAesGcmSecretKeyImpl();
 
@@ -146,14 +61,28 @@ final class _AesGcmSecretKeyImpl implements AesGcmSecretKeyImpl {
     List<int> iv, {
     List<int>? additionalData,
     int? tagLength = 128,
-  }) async => _aesGcmEncryptDecrypt(
-    _key,
-    data,
-    iv,
-    additionalData,
-    tagLength ?? 128,
-    false,
-  );
+  }) async {
+    try {
+      final tLenBits = tagLength ?? 128;
+      if (tLenBits % 8 != 0) {
+        throw ArgumentError('tagLength must be multiple of 8');
+      }
+      // boringssl_dart expects bytes
+      final tLenBytes = tLenBits ~/ 8;
+
+      return ssl.AesGcm.decrypt(
+        _key,
+        Uint8List.fromList(iv),
+        Uint8List.fromList(data),
+        additionalData: additionalData != null
+            ? Uint8List.fromList(additionalData)
+            : null,
+        tagLength: tLenBytes,
+      );
+    } catch (e) {
+      throw operationError('AES-GCM decrypt failed: $e');
+    }
+  }
 
   @override
   Future<Uint8List> encryptBytes(
@@ -161,14 +90,33 @@ final class _AesGcmSecretKeyImpl implements AesGcmSecretKeyImpl {
     List<int> iv, {
     List<int>? additionalData,
     int? tagLength = 128,
-  }) async => _aesGcmEncryptDecrypt(
-    _key,
-    data,
-    iv,
-    additionalData,
-    tagLength ?? 128,
-    true,
-  );
+  }) async {
+    try {
+      if (data.length > (1 << 39) - 256) {
+        throw operationError('data may not be more than 2^39 - 256 bytes');
+      }
+      final tLenBits = tagLength ?? 128;
+      if (tLenBits % 8 != 0) {
+        throw ArgumentError('tagLength must be multiple of 8');
+      }
+      final tLenBytes = tLenBits ~/ 8;
+
+      return ssl.AesGcm.encrypt(
+        _key,
+        Uint8List.fromList(iv),
+        Uint8List.fromList(data),
+        additionalData: additionalData != null
+            ? Uint8List.fromList(additionalData)
+            : null,
+        tagLength: tLenBytes,
+      );
+    } catch (e) {
+      if (e is ArgumentError || e is OperationError) {
+        rethrow;
+      }
+      throw operationError('AES-GCM encrypt failed: $e');
+    }
+  }
 
   @override
   Future<Map<String, dynamic>> exportJsonWebKey() async =>

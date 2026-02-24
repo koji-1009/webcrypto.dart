@@ -20,25 +20,28 @@ Future<RsaSsaPkcs1V15PrivateKeyImpl> rsassaPkcs1V15PrivateKey_importPkcs8Key(
   List<int> keyData,
   HashImpl hash,
 ) async {
-  // Get hash first, to avoid a leak of EVP_PKEY if _HashImpl.fromHash throws
-  final h = _HashImpl.fromHash(hash);
-  return _RsaSsaPkcs1V15PrivateKeyImpl(_importPkcs8RsaPrivateKey(keyData), h);
+  return _RsaSsaPkcs1v15PrivateKeyImpl(
+    ssl.RsaKey.importPkcs8(Uint8List.fromList(keyData)),
+    hash,
+  );
 }
 
 Future<RsaSsaPkcs1V15PrivateKeyImpl> rsassaPkcs1V15PrivateKey_importJsonWebKey(
   Map<String, dynamic> jwk,
   HashImpl hash,
 ) async {
-  // Get hash first, to avoid a leak of EVP_PKEY if _HashImpl.fromHash throws
+  final k = JsonWebKey.fromJson(jwk);
   final h = _HashImpl.fromHash(hash);
-  return _RsaSsaPkcs1V15PrivateKeyImpl(
-    _importJwkRsaPrivateOrPublicKey(
-      JsonWebKey.fromJson(jwk),
-      isPrivateKey: true,
-      expectedUse: 'sig',
-      expectedAlg: h.rsassaPkcs1V15JwkAlg,
-    ),
-    h,
+
+  _checkJwkRsa(
+    k,
+    isPrivateKey: true,
+    expectedAlg: h.rsassaPkcs1V15JwkAlg,
+    expectedUse: 'sig',
+  );
+  return _RsaSsaPkcs1v15PrivateKeyImpl(
+    _importJwkRsa(k, isPrivateKey: true),
+    hash,
   );
 }
 
@@ -48,12 +51,11 @@ rsassaPkcs1V15PrivateKey_generateKey(
   BigInt publicExponent,
   HashImpl hash,
 ) async {
-  // Get hash first, to avoid a leak of EVP_PKEY if _HashImpl.fromHash throws
-  final h = _HashImpl.fromHash(hash);
-  final keys = await _generateRsaKeyPair(modulusLength, publicExponent);
-  return (
-    privateKey: _RsaSsaPkcs1V15PrivateKeyImpl(keys.privateKey, h),
-    publicKey: _RsaSsaPkcs1V15PublicKeyImpl(keys.publicKey, h),
+  return _generateRsaKeyPair(
+    modulusLength,
+    publicExponent,
+    (k) => _RsaSsaPkcs1v15PrivateKeyImpl(k, hash),
+    (k) => _RsaSsaPkcs1v15PublicKeyImpl(k, hash),
   );
 }
 
@@ -61,31 +63,34 @@ Future<RsaSsaPkcs1V15PublicKeyImpl> rsassaPkcs1V15PublicKey_importSpkiKey(
   List<int> keyData,
   HashImpl hash,
 ) async {
-  // Get hash first, to avoid a leak of EVP_PKEY if _HashImpl.fromHash throws
-  final h = _HashImpl.fromHash(hash);
-  return _RsaSsaPkcs1V15PublicKeyImpl(_importSpkiRsaPublicKey(keyData), h);
+  return _RsaSsaPkcs1v15PublicKeyImpl(
+    ssl.RsaKey.importSpki(Uint8List.fromList(keyData)),
+    hash,
+  );
 }
 
 Future<RsaSsaPkcs1V15PublicKeyImpl> rsassaPkcs1V15PublicKey_importJsonWebKey(
   Map<String, dynamic> jwk,
   HashImpl hash,
 ) async {
-  // Get hash first, to avoid a leak of EVP_PKEY if _HashImpl.fromHash throws
+  final k = JsonWebKey.fromJson(jwk);
   final h = _HashImpl.fromHash(hash);
-  return _RsaSsaPkcs1V15PublicKeyImpl(
-    _importJwkRsaPrivateOrPublicKey(
-      JsonWebKey.fromJson(jwk),
-      isPrivateKey: false,
-      expectedUse: 'sig',
-      expectedAlg: h.rsassaPkcs1V15JwkAlg,
-    ),
-    h,
+
+  _checkJwkRsa(
+    k,
+    isPrivateKey: false,
+    expectedAlg: h.rsassaPkcs1V15JwkAlg,
+    expectedUse: 'sig',
+  );
+  return _RsaSsaPkcs1v15PublicKeyImpl(
+    _importJwkRsa(k, isPrivateKey: false),
+    hash,
   );
 }
 
-final class _StaticRsaSsaPkcs1V15PrivateKeyImpl
+final class _StaticRsaSsaPkcs1PrivateKeyImpl
     implements StaticRsaSsaPkcs1v15PrivateKeyImpl {
-  const _StaticRsaSsaPkcs1V15PrivateKeyImpl();
+  const _StaticRsaSsaPkcs1PrivateKeyImpl();
 
   @override
   Future<RsaSsaPkcs1V15PrivateKeyImpl> importPkcs8Key(
@@ -102,58 +107,75 @@ final class _StaticRsaSsaPkcs1V15PrivateKeyImpl
   @override
   Future<(RsaSsaPkcs1V15PrivateKeyImpl, RsaSsaPkcs1V15PublicKeyImpl)>
   generateKey(int modulusLength, BigInt publicExponent, HashImpl hash) async {
-    final KeyPair<RsaSsaPkcs1V15PrivateKeyImpl, RsaSsaPkcs1V15PublicKeyImpl>
-    pair = await rsassaPkcs1V15PrivateKey_generateKey(
+    final keyPair = await rsassaPkcs1V15PrivateKey_generateKey(
       modulusLength,
       publicExponent,
       hash,
     );
-
-    return (pair.privateKey, pair.publicKey);
+    return (keyPair.privateKey, keyPair.publicKey);
   }
 }
 
-final class _RsaSsaPkcs1V15PrivateKeyImpl
+final class _RsaSsaPkcs1v15PrivateKeyImpl
     implements RsaSsaPkcs1V15PrivateKeyImpl {
-  final _EvpPKey _key;
-  final _HashImpl _hash;
+  final ssl.RsaKey _key;
+  final HashImpl _hash;
 
-  _RsaSsaPkcs1V15PrivateKeyImpl(this._key, this._hash);
+  _RsaSsaPkcs1v15PrivateKeyImpl(this._key, this._hash);
 
   @override
   String toString() {
-    return 'Instance of \'RsassaPkcs1V15PrivateKey\'';
+    return 'Instance of \'RsaSsaPkcs1v15PrivateKey\'';
   }
 
   @override
-  Future<Uint8List> signBytes(List<int> data) => signStream(Stream.value(data));
-
-  @override
-  Future<Uint8List> signStream(Stream<List<int>> data) => _signStream(
-    _key,
-    _hash._md,
-    data,
-    config: (ctx) {
-      _checkOpIsOne(ssl.EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING));
-    },
-  );
-
-  @override
-  Future<Map<String, dynamic>> exportJsonWebKey() async =>
-      _exportJwkRsaPrivateOrPublicKey(
+  Future<Uint8List> signBytes(List<int> data) async {
+    try {
+      return ssl.RsaSsaPkcs1.sign(
         _key,
-        isPrivateKey: true,
-        jwkAlg: _hash.rsassaPkcs1V15JwkAlg,
-        jwkUse: 'sig',
+        Uint8List.fromList(data),
+        _HashImpl.fromHash(_hash).hashName,
       );
+    } catch (e) {
+      throw operationError('RSASSA-PKCS1-v1_5 sign failed: $e');
+    }
+  }
 
   @override
-  Future<Uint8List> exportPkcs8Key() async => _exportPkcs8Key(_key);
+  Future<Uint8List> signStream(Stream<List<int>> data) async {
+    try {
+      final buffer = BytesBuilder();
+      await for (final chunk in data) {
+        buffer.add(chunk);
+      }
+      return ssl.RsaSsaPkcs1.sign(
+        _key,
+        buffer.toBytes(),
+        _HashImpl.fromHash(_hash).hashName,
+      );
+    } catch (e) {
+      throw operationError('RSASSA-PKCS1-v1_5 sign stream failed: $e');
+    }
+  }
+
+  @override
+  Future<Map<String, dynamic>> exportJsonWebKey() async {
+    final h = _HashImpl.fromHash(_hash);
+    return _exportJwkRsa(
+      _key,
+      isPrivateKey: true,
+      jwkAlg: h.rsassaPkcs1V15JwkAlg,
+      jwkUse: 'sig',
+    );
+  }
+
+  @override
+  Future<Uint8List> exportPkcs8Key() async => _key.exportPkcs8();
 }
 
-final class _StaticRsaSsaPkcs1V15PublicKeyImpl
+final class _StaticRsaSsaPkcs1PublicKeyImpl
     implements StaticRsaSsaPkcs1v15PublicKeyImpl {
-  const _StaticRsaSsaPkcs1V15PublicKeyImpl();
+  const _StaticRsaSsaPkcs1PublicKeyImpl();
 
   @override
   Future<RsaSsaPkcs1V15PublicKeyImpl> importSpkiKey(
@@ -168,40 +190,56 @@ final class _StaticRsaSsaPkcs1V15PublicKeyImpl
   ) => rsassaPkcs1V15PublicKey_importJsonWebKey(jwk, hash);
 }
 
-final class _RsaSsaPkcs1V15PublicKeyImpl
+final class _RsaSsaPkcs1v15PublicKeyImpl
     implements RsaSsaPkcs1V15PublicKeyImpl {
-  final _EvpPKey _key;
-  final _HashImpl _hash;
+  final ssl.RsaKey _key;
+  final HashImpl _hash;
 
-  _RsaSsaPkcs1V15PublicKeyImpl(this._key, this._hash);
-
-  @override
-  Future<bool> verifyBytes(List<int> signature, List<int> data) =>
-      verifyStream(signature, Stream.value(data));
+  _RsaSsaPkcs1v15PublicKeyImpl(this._key, this._hash);
 
   @override
-  Future<bool> verifyStream(List<int> signature, Stream<List<int>> data) =>
-      _verifyStream(
+  String toString() {
+    return 'Instance of \'RsaSsaPkcs1v15PublicKey\'';
+  }
+
+  @override
+  Future<bool> verifyBytes(List<int> signature, List<int> data) async {
+    try {
+      return ssl.RsaSsaPkcs1.verify(
         _key,
-        _hash._md,
-        signature,
-        data,
-        config: (ctx) {
-          _checkOpIsOne(
-            ssl.EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING),
-          );
-        },
+        Uint8List.fromList(signature),
+        Uint8List.fromList(data),
+        _HashImpl.fromHash(_hash).hashName,
       );
+    } catch (e) {
+      return false;
+    }
+  }
 
   @override
-  Future<Map<String, dynamic>> exportJsonWebKey() async =>
-      _exportJwkRsaPrivateOrPublicKey(
-        _key,
-        isPrivateKey: false,
-        jwkAlg: _hash.rsassaPkcs1V15JwkAlg,
-        jwkUse: 'sig',
-      );
+  Future<bool> verifyStream(List<int> signature, Stream<List<int>> data) async {
+    try {
+      final buffer = BytesBuilder();
+      await for (final chunk in data) {
+        buffer.add(chunk);
+      }
+      return verifyBytes(signature, buffer.toBytes());
+    } catch (e) {
+      return false;
+    }
+  }
 
   @override
-  Future<Uint8List> exportSpkiKey() async => _exportSpkiKey(_key);
+  Future<Map<String, dynamic>> exportJsonWebKey() async {
+    final h = _HashImpl.fromHash(_hash);
+    return _exportJwkRsa(
+      _key,
+      isPrivateKey: false,
+      jwkAlg: h.rsassaPkcs1V15JwkAlg,
+      jwkUse: 'sig',
+    );
+  }
+
+  @override
+  Future<Uint8List> exportSpkiKey() async => _key.exportSpki();
 }

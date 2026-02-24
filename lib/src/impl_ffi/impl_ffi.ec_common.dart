@@ -14,340 +14,78 @@
 
 part of 'impl_ffi.dart';
 
-/// Get `ssl.NID_...` from BoringSSL matching the given [curve].
-int _ecCurveToNID(EllipticCurve curve) {
-  if (curve == EllipticCurve.p256) {
-    return NID_X9_62_prime256v1;
-  }
-  if (curve == EllipticCurve.p384) {
-    return NID_secp384r1;
-  }
-  if (curve == EllipticCurve.p521) {
-    return NID_secp521r1;
-  }
-  // This should never happen!
-  throw UnsupportedError('curve "$curve" is not supported');
+String _ecCurveName(EllipticCurve curve) {
+  return switch (curve) {
+    EllipticCurve.p256 => 'P-256',
+    EllipticCurve.p384 => 'P-384',
+    EllipticCurve.p521 => 'P-521',
+  };
 }
 
-/// Get [EllipticCurve] from matching BoringSSL `ssl.NID_...`.
-EllipticCurve _ecCurveFromNID(int nid) {
-  if (nid == NID_X9_62_prime256v1) {
-    return EllipticCurve.p256;
+// Helpers for Jwk import validation
+void _checkJwkEc(
+  JsonWebKey jwk, {
+  required bool isPrivateKey,
+  required String expectedUse,
+  required String curveName,
+  String? expectedAlg,
+}) {
+  if (jwk.kty != 'EC') {
+    throw const FormatException('JWK "kty" must be "EC"');
   }
-  if (nid == NID_secp384r1) {
-    return EllipticCurve.p384;
+  if (jwk.x == null || jwk.y == null) {
+    throw const FormatException('JWK "x" and "y" must be present');
   }
-  if (nid == NID_secp521r1) {
-    return EllipticCurve.p521;
+  if (isPrivateKey && jwk.d == null) {
+    throw const FormatException('JWK "d" must be present for private keys');
   }
-  // This should never happen!
-  throw operationError('internal error detecting curve');
+  if (!isPrivateKey && jwk.d != null) {
+    throw const FormatException('JWK "d" must not be present for public keys');
+  }
+  if (jwk.crv != curveName) {
+    throw FormatException('JWK "crv" must be "$curveName"');
+  }
+  if (expectedAlg != null && jwk.alg != null && jwk.alg != expectedAlg) {
+    throw FormatException('JWK "alg" must be "$expectedAlg"');
+  }
+  if (jwk.use != null && jwk.use != expectedUse) {
+    throw FormatException('JWK "use" must be "$expectedUse"');
+  }
 }
 
-String _ecCurveToJwkCrv(EllipticCurve curve) {
-  if (curve == EllipticCurve.p256) {
-    return 'P-256';
-  }
-  if (curve == EllipticCurve.p384) {
-    return 'P-384';
-  }
-  if (curve == EllipticCurve.p521) {
-    return 'P-521';
-  }
-  // This should never happen!
-  throw UnsupportedError('curve "$curve" is not supported');
-}
-
-/// Perform some post-import validation for EC keys.
-void _validateEllipticCurveKey(_EvpPKey key, EllipticCurve curve) {
-  return _Scope.sync((scope) {
-    _checkData(
-      ssl.EVP_PKEY_id.invoke(key) == EVP_PKEY_EC,
-      message: 'key is not an EC key',
-    );
-
-    final ec = ssl.EVP_PKEY_get1_EC_KEY.invoke(key);
-    _checkData(ec.address != 0, fallback: 'key is not an EC key');
-    scope.defer(() => ssl.EC_KEY_free(ec));
-
-    _checkDataIsOne(ssl.EC_KEY_check_key(ec), fallback: 'invalid key');
-
-    // When importing BoringSSL will compute the public key if omitted, and
-    // leave a flag, such that exporting the private key won't include the
-    // public key.
-    final encFlags = ssl.EC_KEY_get_enc_flags(ec);
-    ssl.EC_KEY_set_enc_flags(ec, encFlags & ~EC_PKEY_NO_PUBKEY);
-
-    // Check the curve of the imported key
-    final nid = ssl.EC_GROUP_get_curve_name(ssl.EC_KEY_get0_group(ec));
-    _checkData(
-      _ecCurveToNID(curve) == nid,
-      message: 'incorrect elliptic curve',
-    );
-  });
-}
-
-_EvpPKey _importPkcs8EcPrivateKey(List<int> keyData, EllipticCurve curve) {
-  return _Scope.sync((scope) {
-    final k = ssl.EVP_parse_private_key(scope.createCBS(keyData));
-    _checkData(k.address != 0, fallback: 'unable to parse key');
-    final key = _EvpPKey.wrap(k);
-    _validateEllipticCurveKey(key, curve);
-    return key;
-  });
-}
-
-_EvpPKey _importSpkiEcPublicKey(List<int> keyData, EllipticCurve curve) {
-  return _Scope.sync((scope) {
-    // TODO: When calling EVP_parse_public_key it might wise to check that CBS_len(cbs) == 0 is true afterwards
-    // otherwise it might be that all of the contents of the key was not consumed and we should throw
-    // a FormatException. Notice that this the case for private/public keys, and RSA keys.
-    final k = ssl.EVP_parse_public_key(scope.createCBS(keyData));
-    _checkData(k.address != 0, fallback: 'unable to parse key');
-    final key = _EvpPKey.wrap(k);
-
-    _validateEllipticCurveKey(key, curve);
-
-    return key;
-  });
-}
-
-_EvpPKey _importJwkEcPrivateOrPublicKey(
+ssl.EcKey _importJwkEc(
   JsonWebKey jwk,
   EllipticCurve curve, {
   required bool isPrivateKey,
-  required String expectedUse,
-  String? expectedAlg, // may be null, if 'alg' property isn't validated (ECDH)
 }) {
-  _checkData(
-    jwk.kty == 'EC',
-    message: 'expected a elliptic-curve key, JWK property "kty" must be "EC"',
+  final curveName = _ecCurveName(curve);
+
+  // Decoding helpers
+  Uint8List decode(String val, String prop) =>
+      _jwkDecodeBase64UrlNoPadding(val, prop);
+
+  return ssl.EcKey.importCoordinates(
+    curve: curveName,
+    x: decode(jwk.x!, 'x'),
+    y: decode(jwk.y!, 'y'),
+    d: isPrivateKey ? decode(jwk.d!, 'd') : null,
   );
-  _checkData(
-    jwk.x != null,
-    message: 'expected a elliptic-curve key, JWK property "x" to be present',
-  );
-  _checkData(
-    jwk.y != null,
-    message: 'expected a elliptic-curve key, JWK property "y" to be present',
-  );
-  if (isPrivateKey) {
-    _checkData(
-      jwk.d != null,
-      message: 'expected a private key, JWK property "d" is missing',
-    );
-  } else {
-    _checkData(
-      jwk.d == null,
-      message: 'expected a public key, JWK property "d" is present',
-    );
-  }
-
-  final crv = _ecCurveToJwkCrv(curve);
-  _checkData(jwk.crv == crv, message: 'JWK property "crv" is not "$crv"');
-
-  _checkData(
-    expectedAlg == null || jwk.alg == null || jwk.alg == expectedAlg,
-    message: 'JWK property "alg" should be "$expectedAlg", if present',
-  );
-
-  _checkData(
-    jwk.use == null || jwk.use == expectedUse,
-    message: 'JWK property "use" should be "$expectedUse", if present',
-  );
-
-  // TODO: Reject keys with key_ops in inconsistent with isPrivateKey
-  //       Also in the js implementation...
-
-  return _Scope.sync((scope) {
-    final ec = ssl.EC_KEY_new_by_curve_name(_ecCurveToNID(curve));
-    _checkOp(ec.address != 0, fallback: 'internal failure to use curve');
-    scope.defer(() => ssl.EC_KEY_free(ec));
-
-    // We expect parameters to have this size
-    final paramSize = _numBitsToBytes(
-      ssl.EC_GROUP_get_degree(ssl.EC_KEY_get0_group(ec)),
-    );
-
-    // Utility to decode a JWK parameter.
-    ffi.Pointer<BIGNUM> decodeParam(String val, String prop) {
-      final bytes = _jwkDecodeBase64UrlNoPadding(val, prop);
-      _checkData(
-        bytes.length == paramSize,
-        message: 'JWK property "$prop" should hold $paramSize bytes',
-      );
-      final bn = ssl.BN_bin2bn(
-        scope.dataAsPointer(bytes),
-        bytes.length,
-        ffi.nullptr,
-      );
-      _checkData(bn.address != 0);
-      scope.defer(() => ssl.BN_free(bn));
-      return bn;
-    }
-
-    // Note: ideally we wouldn't throw data errors in case of internal errors
-    _checkDataIsOne(
-      ssl.EC_KEY_set_public_key_affine_coordinates(
-        ec,
-        decodeParam(jwk.x!, 'x'),
-        decodeParam(jwk.y!, 'y'),
-      ),
-      fallback: 'invalid EC key',
-    );
-
-    if (isPrivateKey) {
-      _checkDataIsOne(
-        ssl.EC_KEY_set_private_key(ec, decodeParam(jwk.d!, 'd')),
-        fallback: 'invalid EC key',
-      );
-    }
-
-    _checkDataIsOne(ssl.EC_KEY_check_key(ec), fallback: 'invalid EC key');
-
-    // Wrap with an EVP_KEY
-    final key = _EvpPKey();
-    _checkOpIsOne(ssl.EVP_PKEY_set1_EC_KEY.invoke(key, ec));
-
-    return key;
-  });
 }
 
-_EvpPKey _importRawEcPublicKey(List<int> keyData, EllipticCurve curve) {
-  // See: https://chromium.googlesource.com/chromium/src/+/43d62c50b705f88c67b14539e91fd8fd017f70c4/components/webcrypto/algorithms/ec.cc#332
-  return _Scope.sync((scope) {
-    // Create EC_KEY for the curve
-    final ec = ssl.EC_KEY_new_by_curve_name(_ecCurveToNID(curve));
-    _checkOp(ec.address != 0, fallback: 'internal failure to use curve');
-    scope.defer(() => ssl.EC_KEY_free(ec));
-
-    // Create EC_POINT to hold public key info
-    final pub = ssl.EC_POINT_new(ssl.EC_KEY_get0_group(ec));
-    _checkOp(pub.address != 0, fallback: 'internal point allocation error');
-    scope.defer(() => ssl.EC_POINT_free(pub));
-
-    // Read raw public key
-    _checkDataIsOne(
-      ssl.EC_POINT_oct2point(
-        ssl.EC_KEY_get0_group(ec),
-        pub,
-        scope.dataAsPointer(keyData),
-        keyData.length,
-        ffi.nullptr,
-      ),
-      fallback: 'invalid keyData',
-    );
-    // Copy pub point to ec
-    _checkDataIsOne(
-      ssl.EC_KEY_set_public_key(ec, pub),
-      fallback: 'invalid keyData',
-    );
-
-    final key = _EvpPKey();
-    _checkOpIsOne(ssl.EVP_PKEY_set1_EC_KEY.invoke(key, ec));
-    _validateEllipticCurveKey(key, curve);
-
-    return key;
-  });
-}
-
-Uint8List _exportRawEcPublicKey(_EvpPKey key) {
-  return _Scope.sync((scope) {
-    final ec = ssl.EVP_PKEY_get1_EC_KEY.invoke(key);
-    _checkOp(ec.address != 0, fallback: 'internal key type invariant error');
-    scope.defer(() => ssl.EC_KEY_free(ec));
-
-    final cbb = scope.createCBB();
-    _checkOpIsOne(
-      ssl.EC_POINT_point2cbb(
-        cbb,
-        ssl.EC_KEY_get0_group(ec),
-        ssl.EC_KEY_get0_public_key(ec),
-        point_conversion_form_t.POINT_CONVERSION_UNCOMPRESSED,
-        ffi.nullptr,
-      ),
-      fallback: 'formatting failed',
-    );
-    return cbb.copy();
-  });
-}
-
-Map<String, dynamic> _exportJwkEcPrivateOrPublicKey(
-  _EvpPKey key, {
+Map<String, dynamic> _exportJwkEc(
+  ssl.EcKey key, {
   required bool isPrivateKey,
-  String? jwkUse,
+  required String jwkUse,
 }) {
-  return _Scope.sync((scope) {
-    final ec = ssl.EVP_PKEY_get1_EC_KEY.invoke(key);
-    _checkOp(ec.address != 0, fallback: 'internal key type invariant error');
-    scope.defer(() => ssl.EC_KEY_free(ec));
+  final coords = key.exportCoordinates();
+  // coords has x, y, (d) as Uint8List
 
-    final group = ssl.EC_KEY_get0_group(ec);
-    final curve = _ecCurveFromNID(ssl.EC_GROUP_get_curve_name(group));
-
-    // Determine byte size used for encoding params
-    final paramSize = _numBitsToBytes(ssl.EC_GROUP_get_degree(group));
-
-    final x = scope.createBN();
-    final y = scope.createBN();
-
-    _checkOpIsOne(
-      ssl.EC_POINT_get_affine_coordinates_GFp(
-        group,
-        ssl.EC_KEY_get0_public_key(ec),
-        x,
-        y,
-        ffi.nullptr,
-      ),
-    );
-
-    // Create an output buffer
-    final out = scope<ffi.Uint8>(paramSize);
-
-    _checkOpIsOne(ssl.BN_bn2bin_padded(out, paramSize, x));
-    final xBytes = out.copy(paramSize);
-    _checkOpIsOne(ssl.BN_bn2bin_padded(out, paramSize, y));
-    final yBytes = out.copy(paramSize);
-
-    Uint8List? dBytes;
-    if (isPrivateKey) {
-      final d = ssl.EC_KEY_get0_private_key(ec);
-      _checkOpIsOne(ssl.BN_bn2bin_padded(out, paramSize, d));
-      dBytes = out.copy(paramSize);
-    }
-
-    return JsonWebKey(
-      kty: 'EC',
-      use: jwkUse,
-      crv: _ecCurveToJwkCrv(curve),
-      x: _jwkEncodeBase64UrlNoPadding(xBytes),
-      y: _jwkEncodeBase64UrlNoPadding(yBytes),
-      d: dBytes != null ? _jwkEncodeBase64UrlNoPadding(dBytes) : null,
-    ).toJson();
-  });
-}
-
-KeyPair<_EvpPKey, _EvpPKey> _generateEcKeyPair(EllipticCurve curve) {
-  return _Scope.sync((scope) {
-    final ecPriv = ssl.EC_KEY_new_by_curve_name(_ecCurveToNID(curve));
-    _checkOp(ecPriv.address != 0, fallback: 'internal failure to use curve');
-    scope.defer(() => ssl.EC_KEY_free(ecPriv));
-
-    _checkOpIsOne(ssl.EC_KEY_generate_key(ecPriv));
-
-    final privKey = _EvpPKey();
-    _checkOpIsOne(ssl.EVP_PKEY_set1_EC_KEY.invoke(privKey, ecPriv));
-
-    final ecPub = ssl.EC_KEY_new_by_curve_name(_ecCurveToNID(curve));
-    _checkOp(ecPub.address != 0);
-    scope.defer(() => ssl.EC_KEY_free(ecPub));
-    _checkOpIsOne(
-      ssl.EC_KEY_set_public_key(ecPub, ssl.EC_KEY_get0_public_key(ecPriv)),
-    );
-
-    final pubKey = _EvpPKey();
-    _checkOpIsOne(ssl.EVP_PKEY_set1_EC_KEY.invoke(pubKey, ecPub));
-
-    return (privateKey: privKey, publicKey: pubKey);
-  });
+  return JsonWebKey(
+    kty: 'EC',
+    use: jwkUse,
+    crv: key.curve, // EcKey stores 'P-256' etc.
+    x: _jwkEncodeBase64UrlNoPadding(coords['x']!),
+    y: _jwkEncodeBase64UrlNoPadding(coords['y']!),
+    d: isPrivateKey ? _jwkEncodeBase64UrlNoPadding(coords['d']!) : null,
+  ).toJson();
 }

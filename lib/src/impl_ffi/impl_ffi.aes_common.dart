@@ -32,8 +32,9 @@ Uint8List _aesImportJwkKey(
 }) {
   final k = JsonWebKey.fromJson(jwk);
 
-  void checkJwk(bool condition, String prop, String message) =>
-      _checkData(condition, message: 'JWK property "$prop" $message');
+  void checkJwk(bool condition, String prop, String message) {
+    if (!condition) throw FormatException('JWK property "$prop" $message');
+  }
 
   checkJwk(k.kty == 'oct', 'kty', 'must be "oct"');
   checkJwk(k.k != null, 'k', 'must be present');
@@ -88,6 +89,6 @@ Uint8List _aesGenerateKey(int length) {
     throw const FormatException('keyData for AES must be 128 or 256 bits');
   }
   final keyData = Uint8List(length ~/ 8);
-  fillRandomBytes(keyData);
+  ssl.getRandomValues(keyData);
   return keyData;
 }
