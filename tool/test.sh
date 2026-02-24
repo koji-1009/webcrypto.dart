@@ -57,7 +57,7 @@ xvfb-run "$DIR/with-chromedriver.sh" flutter drive \
 # Firefox (xvfb-run, is necessary for Firefox testing to work)
 cd "$DIR/.."
 
-section 'flutter pub run test (vm,chrome,firefox)'
-xvfb-run flutter pub run test -p vm,chrome,firefox
+section 'dart test (vm,chrome,firefox)'
+xvfb-run dart test -p vm,chrome,firefox
 
 echo '### All tests passed'

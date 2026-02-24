@@ -3,7 +3,6 @@ on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
 
 env:
   PUB_ENVIRONMENT: bot.github
@@ -22,8 +21,8 @@ jobs:
       - run: flutter pub get
       - run: dart format --output none --set-exit-if-changed .
       - run: dart analyze --fatal-warnings .
-  linux:
-    name: Linux desktop / Chrome / Firefox
+  linux-native:
+    name: Linux native
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -39,10 +38,25 @@ jobs:
           flutter config --no-analytics
       - run: flutter pub get
       - run: flutter test
-      - run: flutter test --platform chrome
-      - run: flutter test --platform chrome --wasm
       - run: xvfb-run flutter test integration_test/webcrypto_test.dart -d linux
         working-directory: ./example
+      - run: dart test -p vm
+  linux-browser:
+    name: Linux browser
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+      - name: Configure Flutter
+        run: |
+          flutter config --no-analytics
+      - run: flutter pub get
+      - run: flutter test --platform chrome
+      - run: flutter test --platform chrome --wasm
       - uses: nanasess/setup-chromedriver@v2
       - name: Run integration_test with chromedriver
         working-directory: ./example
@@ -51,10 +65,10 @@ jobs:
             --driver=test_driver/integration_test.dart \
             --target=integration_test/webcrypto_test.dart \
             -d chrome
-      - run: xvfb-run flutter pub run test -p vm,chrome,firefox
-  macos-14:
-    name: MacOS 14 desktop / Chrome / Firefox
-    runs-on: macos-14 # Test with xcode 15
+      - run: xvfb-run dart test -p firefox
+  macos-native:
+    name: MacOS native
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -67,30 +81,12 @@ jobs:
           flutter config --no-analytics
       - run: flutter pub get
       - run: flutter test
-      - run: flutter test --platform chrome
-      - run: flutter test --platform chrome --wasm
       - run: flutter test integration_test/webcrypto_test.dart -d macos
         working-directory: ./example
-      # TODO: Enable chromedriver testing on MacOS when it works reliably
-      #- uses: nanasess/setup-chromedriver@v2
-      #- name: Run integration_test with chromedriver
-      #  working-directory: ./example
-      #  run: |
-      #    ../tool/with-chromedriver.sh flutter drive \
-      #      --driver=test_driver/integration_test.dart \
-      #      --target=integration_test/webcrypto_test.dart \
-      #      -d chrome
-      - uses: browser-actions/setup-firefox@v1
-      - name: flutter pub run test -p vm,chrome,firefox
-        shell: bash
-        # Remove FIREFOX_EXECUTABLE override when flutter upgrades past package:test 1.25.8
-        # Issue is fixed in https://github.com/dart-lang/test/pull/2276
-        run: |
-          export FIREFOX_EXECUTABLE="$(which firefox)"
-          flutter pub run test -p vm,chrome,firefox
-  macos-15:
-    name: MacOS 15 desktop / Chrome / Firefox
-    runs-on: macos-15 # Test with xcode 16
+      - run: dart test -p vm
+  macos-browser:
+    name: MacOS browser
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -102,22 +98,19 @@ jobs:
         run: |
           flutter config --no-analytics
       - run: flutter pub get
-      - run: flutter test
       - run: flutter test --platform chrome
       - run: flutter test --platform chrome --wasm
-      - run: flutter test integration_test/webcrypto_test.dart -d macos
-        working-directory: ./example
       # TODO: Enable chromedriver testing on MacOS when it works reliably
       - uses: browser-actions/setup-firefox@v1
-      - name: flutter pub run test -p vm,chrome,firefox
+      - name: dart test -p firefox
         shell: bash
         # Remove FIREFOX_EXECUTABLE override when flutter upgrades past package:test 1.25.8
         # Issue is fixed in https://github.com/dart-lang/test/pull/2276
         run: |
           export FIREFOX_EXECUTABLE="$(which firefox)"
-          flutter pub run test -p vm,chrome,firefox
-  windows:
-    name: Windows desktop / Chrome / Firefox
+          dart test -p firefox
+  windows-native:
+    name: Windows native
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -132,10 +125,26 @@ jobs:
           flutter config --no-analytics
       - run: flutter pub get
       - run: flutter test
-      #- run: flutter test --platform chrome
-      #- run: flutter test --platform chrome --wasm
       - run: flutter test integration_test/webcrypto_test.dart -d windows
         working-directory: ./example
+      - run: dart test -p vm
+  windows-browser:
+    name: Windows browser
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: ilammy/setup-nasm@v1
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+      - name: Configure Flutter
+        run: |
+          flutter config --no-analytics
+      - run: flutter pub get
+      #- run: flutter test --platform chrome
+      #- run: flutter test --platform chrome --wasm
       - uses: nanasess/setup-chromedriver@v2
       - name: Run integration_test with chromedriver
         working-directory: ./example
@@ -145,10 +154,10 @@ jobs:
             --driver=test_driver/integration_test.dart \
             --target=integration_test/webcrypto_test.dart \
             -d chrome
-      - run: flutter pub run test -p vm,chrome,firefox
+      - run: dart test -p firefox
   ios:
     name: iOS emulator (iPhone)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -161,7 +170,7 @@ jobs:
           flutter config --no-analytics
       - uses: futureware-tech/simulator-action@v3
         with:
-          model: 'iPhone 15'
+          model: 'iPhone 16e'
       - run: flutter pub get
       - run: flutter test integration_test/webcrypto_test.dart -d iphone
         working-directory: ./example
@@ -198,8 +207,8 @@ jobs:
           arch: x86_64
           working-directory: ./example
           script: flutter test integration_test/webcrypto_test.dart -d emulator
-  linux-coverage:
-    name: Linux desktop / Chrome / Firefox (coverage)
+  linux-native-coverage:
+    name: Linux native coverage
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -214,16 +223,38 @@ jobs:
           sudo apt-get install -y ninja-build libgtk-3-dev
           flutter config --no-analytics
       - run: flutter pub get
-      - run: xvfb-run flutter pub run test -p vm,chrome,firefox -c dart2js,dart2wasm --coverage ./coverage
+      - run: dart test -p vm --coverage ./coverage
       # Report collected coverage
       - name: Convert coverage to lcov
         run: dart run coverage:format_coverage -i ./coverage -o ./coverage/lcov.info --lcov --report-on lib/
       - uses: coverallsapp/github-action@v2
         with:
-          flag-name: linux
+          flag-name: linux-native
           parallel: true
-  windows-coverage:
-    name: Windows desktop / Chrome / Firefox (coverage)
+  linux-browser-coverage:
+    name: Linux browser coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+      - name: Configure Flutter
+        run: |
+          flutter config --no-analytics
+      - run: flutter pub get
+      - run: xvfb-run dart test -p chrome,firefox -c dart2js,dart2wasm --coverage ./coverage
+      # Report collected coverage
+      - name: Convert coverage to lcov
+        run: dart run coverage:format_coverage -i ./coverage -o ./coverage/lcov.info --lcov --report-on lib/
+      - uses: coverallsapp/github-action@v2
+        with:
+          flag-name: linux-browser
+          parallel: true
+  windows-native-coverage:
+    name: Windows native coverage
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -237,21 +268,46 @@ jobs:
         run: |
           flutter config --no-analytics
       - run: flutter pub get
-      - run: flutter pub run test -p vm,chrome,firefox --coverage ./coverage
+      - run: dart test -p vm --coverage ./coverage
       # Report collected coverage
       - name: Convert coverage to lcov
         run: dart run coverage:format_coverage -i ./coverage -o ./coverage/lcov.info --lcov --report-on lib/
       - uses: coverallsapp/github-action@v2
         with:
-          flag-name: windows
+          flag-name: windows-native
+          parallel: true
+  windows-browser-coverage:
+    name: Windows browser coverage
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: ilammy/setup-nasm@v1
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+      - name: Configure Flutter
+        run: |
+          flutter config --no-analytics
+      - run: flutter pub get
+      - run: dart test -p chrome,firefox --coverage ./coverage
+      # Report collected coverage
+      - name: Convert coverage to lcov
+        run: dart run coverage:format_coverage -i ./coverage -o ./coverage/lcov.info --lcov --report-on lib/
+      - uses: coverallsapp/github-action@v2
+        with:
+          flag-name: windows-browser
           parallel: true
   coverage:
     name: Report to coveralls
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs:
-      - linux-coverage
-      - windows-coverage
+      - linux-native-coverage
+      - linux-browser-coverage
+      - windows-native-coverage
+      - windows-browser-coverage
     steps:
       - uses: coverallsapp/github-action@v2
         with:
